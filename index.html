@@ -56,9 +56,16 @@
        * though the tunnel hostname changes every time cloudflared restarts.
        */
       const REPO = 'wydgetlabsadmin/pocket-link';
+      /*
+       * Order matters. `raw.githubusercontent.com` keeps serving the file it
+       * has cached for ~5 minutes and ignores the cache-busting query, so after
+       * a tunnel rotation it happily hands back the previous address; the REST
+       * contents endpoint is dynamic and not CDN-cached. Raw stays as a
+       * fallback for when the unauthenticated API rate limit is exhausted.
+       */
       const SOURCES = [
-        `https://raw.githubusercontent.com/${REPO}/main/current.json`,
         `https://api.github.com/repos/${REPO}/contents/current.json`,
+        `https://raw.githubusercontent.com/${REPO}/main/current.json`,
       ];
 
       const el = (id) => document.getElementById(id);
@@ -76,23 +83,42 @@
         return Uint8Array.from(raw, (character) => character.charCodeAt(0));
       }
 
-      /** Both the raw file and the API route end up as the same JSON object. */
-      async function fetchBlob() {
-        for (const source of SOURCES) {
-          try {
-            const response = await fetch(`${source}?t=${Date.now()}`, { cache: 'no-store' });
-            if (!response.ok) continue;
-            const body = await response.json();
-            if (typeof body.iv === 'string' && typeof body.ct === 'string') return body;
-            // The API route wraps the file in base64.
-            if (typeof body.content === 'string') {
-              const text = new TextDecoder().decode(bytesFromBase64Url(body.content.replace(/\s/g, '')));
-              const parsed = JSON.parse(text);
-              if (typeof parsed.iv === 'string' && typeof parsed.ct === 'string') return parsed;
-            }
-          } catch {}
+      /** The API wraps the file in base64; raw hands back the JSON directly. */
+      function unwrap(body) {
+        if (typeof body?.iv === 'string' && typeof body?.ct === 'string') return body;
+        if (typeof body?.content === 'string') {
+          const text = new TextDecoder().decode(
+            bytesFromBase64Url(body.content.replace(/\s/g, '')),
+          );
+          const parsed = JSON.parse(text);
+          if (typeof parsed.iv === 'string' && typeof parsed.ct === 'string') return parsed;
         }
         return null;
+      }
+
+      async function fetchBlob(source) {
+        const response = await fetch(`${source}?t=${Date.now()}`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return unwrap(await response.json());
+      }
+
+      /**
+       * A stale blob is worse than useless: it sends the phone to a hostname
+       * that no longer exists. So each candidate is *probed* first — an opaque
+       * no-cors request counts as up for any HTTP status (a 401 still proves
+       * something answered), and only a real network failure rejects.
+       */
+      async function reachable(url) {
+        try {
+          await fetch(`${url}/api/remote/status`, {
+            mode: 'no-cors',
+            cache: 'no-store',
+            signal: AbortSignal.timeout(6000),
+          });
+          return true;
+        } catch {
+          return false;
+        }
       }
 
       async function main() {
@@ -101,28 +127,47 @@
           fail('Missing key', 'Open the link with its #key on the end.');
           return;
         }
-        const blob = await fetchBlob();
-        if (!blob) {
-          fail('Mac unreachable', 'Could not read the address. Is the Mac online?');
-          return;
-        }
-        let target;
+        let cryptoKey;
         try {
-          const cryptoKey = await crypto.subtle.importKey(
-            'raw',
-            bytesFromBase64Url(key),
-            'AES-GCM',
-            false,
-            ['decrypt'],
-          );
-          const plain = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: bytesFromBase64Url(blob.iv) },
-            cryptoKey,
-            bytesFromBase64Url(blob.ct),
-          );
-          target = JSON.parse(new TextDecoder().decode(plain));
+          cryptoKey = await crypto.subtle.importKey('raw', bytesFromBase64Url(key), 'AES-GCM', false, [
+            'decrypt',
+          ]);
         } catch {
           fail('Wrong link', 'This bookmark no longer matches the key.');
+          return;
+        }
+
+        let read = false;
+        let target = null;
+        for (const source of SOURCES) {
+          let candidate;
+          try {
+            const blob = await fetchBlob(source);
+            if (!blob) continue;
+            read = true;
+            const plain = await crypto.subtle.decrypt(
+              { name: 'AES-GCM', iv: bytesFromBase64Url(blob.iv) },
+              cryptoKey,
+              bytesFromBase64Url(blob.ct),
+            );
+            candidate = JSON.parse(new TextDecoder().decode(plain));
+          } catch {
+            continue;
+          }
+          el('detail').textContent = new URL(candidate.url).host;
+          if (await reachable(candidate.url)) {
+            target = candidate;
+            break;
+          }
+        }
+
+        if (!target) {
+          fail(
+            read ? 'Mac offline' : 'Could not read the address',
+            read
+              ? 'The Mac answered with an address that is not reachable right now.'
+              : 'Is the Mac online? This page cannot reach GitHub either.',
+          );
           return;
         }
         const host = new URL(target.url).host;
